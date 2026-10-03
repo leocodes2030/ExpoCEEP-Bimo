@@ -143,7 +143,7 @@ def perguntar_gemini(texto):
     inicio = time.perf_counter()
 
     interaction = client.interactions.create(
-        model="gemini-3.6-flash",
+        model="gemini-3.5-flash",
         system_instruction=PRE_PROMPT,
         generation_config={"thinking_level": "low"},
         input=texto,
