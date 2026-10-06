@@ -3,17 +3,19 @@ BEMO - assistente de voz
 
 Fluxo:
   microfone -> VAD (detecta fala) -> Whisper (áudio vira texto)
-            -> Gemini (texto vira resposta) -> Piper (resposta vira voz) -> alto-falante
+            -> Gemini (texto vira resposta) -> tela TFT (serial) + Piper (voz) -> alto-falante
 """
 
 import os
 import re
 import subprocess
 import time
+import unicodedata
 from collections import deque
 
 import numpy as np
 import scipy.signal as signal
+import serial
 import sounddevice as sd
 import soundfile as sf
 import sherpa_onnx
@@ -45,11 +47,16 @@ ARQUIVO_WAV = r"C:\BEMO\piper\fala.wav"
 DISPOSITIVO_SAIDA = 5        # número do alto-falante (veja com sd.query_devices())
 SAIDA_SAMPLE_RATE = 48000    # taxa de amostragem que o alto-falante aceita
 
+# Tela TFT (via porta serial)
+PORTA_SERIAL = "COM3"        # porta da placa da tela (veja no Gerenciador de Dispositivos)
+BAUD_SERIAL = 115200         # precisa ser igual ao Serial.begin() da placa
+REMOVER_ACENTOS = True       # True se a fonte da TFT não tem ç, ã, é...
+
 # Palavras que ativam o Bemo (inclui variações que o Whisper costuma escrever)
 PALAVRAS_ATIVACAO = [
     "bemo", "bimo", "beemo", "bemu", "bimu",
     "bemmo", "bimmo", "bemoo", "bimoo", "bemou", "bimou",
-    "be mo", "bi mo", "bembo", "bimbo", "beembo", "beemoo", "beemou",
+    "be mo", "bi mo", "bembo", "bimbo", "beembo", "beemoo", "beemou", "vimo", "vemo", "vimo", "vemu", "vimo", "bimum", "bimon", 
 ]
 PADRAO_ATIVACAO = re.compile(r"\b(" + "|".join(PALAVRAS_ATIVACAO) + r")\b", re.IGNORECASE)
 
@@ -78,6 +85,31 @@ client = genai.Client(
 # ============================================================
 # FUNÇÕES
 # ============================================================
+
+def abrir_tela():
+    """Abre a porta serial da tela TFT. Se falhar, o Bemo segue sem tela."""
+    try:
+        tela = serial.Serial(PORTA_SERIAL, BAUD_SERIAL, timeout=1)
+        time.sleep(2)  # a placa costuma resetar quando a porta abre
+        print(f"Tela conectada em {PORTA_SERIAL}.\n")
+        return tela
+    except serial.SerialException as erro:
+        print(f"Sem tela serial ({erro}). Seguindo sem tela.\n")
+        return None
+
+
+def mostrar_na_tela(tela, texto):
+    """Manda o texto para a TFT, terminado em \\n."""
+    if tela is None:
+        return
+    try:
+        texto = texto.replace("\n", " ").strip()
+        if REMOVER_ACENTOS:
+            texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+        tela.write((texto + "\n").encode("utf-8"))
+    except serial.SerialException as erro:
+        print(f"ERRO NA TELA: {erro}")
+
 
 def escolher_microfone():
     """Lista os microfones e deixa o usuário escolher um."""
@@ -143,7 +175,7 @@ def perguntar_gemini(texto):
     inicio = time.perf_counter()
 
     interaction = client.interactions.create(
-        model="gemini-3.5-flash",
+        model="gemini-3.6-flash",
         system_instruction=PRE_PROMPT,
         generation_config={"thinking_level": "low"},
         input=texto,
@@ -177,7 +209,7 @@ def falar(texto):
             os.remove(ARQUIVO_WAV)
 
 
-def processar_fala(recognizer, blocos):
+def processar_fala(recognizer, blocos, tela):
     """Transcreve a fala gravada e mostra a resposta do Gemini."""
     print("Transcrevendo...")
 
@@ -204,7 +236,10 @@ def processar_fala(recognizer, blocos):
             resposta, tempo_gemini = perguntar_gemini(texto)
             print(f"\nBEMO: {resposta}")
             print(f"Tempo do Gemini: {tempo_gemini:.2f} segundos")
+             # texto aparece na TFT enquanto ele fala
+            mostrar_na_tela(tela, resposta) 
             falar(resposta)
+            
         except Exception as erro:
             print(f"\nERRO AO CONSULTAR O GEMINI: {erro}")
 
@@ -217,6 +252,7 @@ def processar_fala(recognizer, blocos):
 
 def main():
     microfone = escolher_microfone()
+    tela = abrir_tela()
     vad = carregar_vad()
     recognizer = carregar_whisper()
 
@@ -283,7 +319,7 @@ def main():
                         if duracao_fala < DURACAO_MINIMA_FALA:
                             print(">>> Fala muito curta. Ignorando.")
                         else:
-                            processar_fala(recognizer, blocos_fala)
+                            processar_fala(recognizer, blocos_fala, tela)
 
                         # 5) reseta tudo para ouvir a próxima fala
                         blocos_fala = []
@@ -299,6 +335,9 @@ def main():
 
     except KeyboardInterrupt:
         print("\nEncerrando BEMO...")
+    finally:
+        if tela is not None:
+            tela.close()
 
 
 if __name__ == "__main__":
