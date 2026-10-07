@@ -2,8 +2,8 @@
 BEMO - assistente de voz
 
 Fluxo:
-  microfone -> VAD (detecta fala) -> Gemini (áudio vira texto)
-            -> Gemini (texto vira resposta) -> tela TFT (serial) + Piper (voz) -> alto-falante
+  microfone -> VAD (detecta fala) -> Whisper (áudio vira texto)
+            -> IA (texto vira resposta) -> tela TFT (serial) + Piper (voz) -> alto-falante
 """
 
 import io
@@ -21,8 +21,7 @@ import serial
 import sounddevice as sd
 import soundfile as sf
 import sherpa_onnx
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 
 # ============================================================
@@ -30,7 +29,7 @@ from google.genai import types
 # ============================================================
 
 CAPTURE_SAMPLE_RATE = 48000
-VAD_SAMPLE_RATE = 16000     # taxa usada pelo VAD e pelo STT
+VAD_SAMPLE_RATE = 16000     # taxa usada pelo VAD e pelo Whisper
 
 BLOCK_SIZE = 4800           # amostras por bloco (a 48 kHz = 0,1 s)
 BLOCO_SEG = BLOCK_SIZE / CAPTURE_SAMPLE_RATE
@@ -39,35 +38,26 @@ SILENCIO_FINAL = 1          # segundos de silêncio para considerar que a fala a
 PRE_AUDIO = 0.5             # segundos de áudio guardados ANTES da fala começar
 VOLUME_MINIMO = 0.01        # abaixo disso, é considerado silêncio
 DURACAO_MINIMA_FALA = 0.4   # falas mais curtas que isso são ignoradas
-DURACAO_MAXIMA_AUDIO = 30   # áudios maiores que isso são cortados
+DURACAO_MAXIMA_AUDIO = 30   # o Whisper só aceita até 30 s por vez
 
 WHISPER_ENCODER = "sherpa-onnx-whisper-base/base-encoder.int8.onnx"
 WHISPER_DECODER = "sherpa-onnx-whisper-base/base-decoder.int8.onnx"
 WHISPER_TOKENS = "sherpa-onnx-whisper-base/base-tokens.txt"
 VAD_MODEL = "silero_vad.onnx"
 
-# Chave do Gemini: https://aistudio.google.com/apikey
-# Guarde na variável de ambiente GEMINI_API_KEY (export GEMINI_API_KEY="sua-chave")
-GEMINI_CHAVE_ENV = "GEMINI_API_KEY"
-
 # Reconhecimento de fala (STT)
-# "gemini" -> o Gemini transcreve o áudio na nuvem (preciso, precisa de internet)
-# "local"  -> Whisper do sherpa-onnx, offline (menos preciso)
-STT_MODO = "gemini"
-STT_MODELO_GEMINI = "gemini-3.5-flash"   # confira os nomes atuais em https://ai.google.dev/gemini-api/docs/models
-STT_PROMPT = (
-    "Transcreva fielmente o áudio, que está em português do Brasil. "
-    "O nome do assistente é Bemo e pode aparecer na fala (exemplo: 'Bemo, que horas são?'). "
-    "Responda SOMENTE com a transcrição, sem comentários, aspas ou explicações. "
-    "Se não houver fala humana clara, responda exatamente: [SEM FALA]"
-)
+# "groq"  -> Whisper large-v3-turbo na nuvem (muito mais preciso, precisa de internet)
+# "local" -> Whisper do sherpa-onnx, offline (menos preciso)
+STT_MODO = "groq"
+STT_MODELO_GROQ = "whisper-large-v3-turbo"
+STT_DICA = "Bemo, qual é a capital da França? Bemo, que horas são?"  # ajuda o Whisper a acertar o nome
 
 # Piper (TTS: transforma texto em voz)
 PIPER = "piper"
 PIPER_MODEL = "/home/leonardo/Downloads/ExpoCEEP-Bimo/pt_BR-cadu-medium.onnx"
 PASTA_WAV = "/home/leonardo/Downloads/ExpoCEEP-Bimo/wavs"
-DISPOSITIVO_SAIDA = None     # None = alto-falante padrão do sistema (ou use um número de sd.query_devices())
-SAIDA_SAMPLE_RATE = 48000    # taxa de amostragem que o alto-falante aceita
+ESCOLHER_SAIDA = True        # True = pergunta qual alto-falante usar ao iniciar (Enter = padrão do sistema)
+SAIDA_SAMPLE_RATE = 48000    # taxa preferida; se o dispositivo escolhido não aceitar, usa a taxa dele
 
 # Tela TFT (via porta serial)
 # Windows usa COMx. No Linux costuma ser /dev/ttyUSB0 ou /dev/ttyACM0.
@@ -75,7 +65,7 @@ PORTA_SERIAL = "COM3" if os.name == "nt" else "/dev/ttyUSB0"
 BAUD_SERIAL = 115200         # precisa ser igual ao Serial.begin() da placa
 REMOVER_ACENTOS = True       # True se a fonte da TFT não tem ç, ã, é...
 
-# Palavras que ativam o Bemo (inclui variações que o STT costuma escrever)
+# Palavras que ativam o Bemo (inclui variações que o Whisper costuma escrever)
 PALAVRAS_ATIVACAO = [
     "bemo", "bimo", "beemo", "bemu", "bimu",
     "bemmo", "bimmo", "bemoo", "bimoo", "bemou", "bimou",
@@ -99,15 +89,20 @@ Regras:
 - Escreva números, siglas e termos técnicos de forma clara para serem lidos em voz alta.
 """
 
-# IA de resposta (Gemini)
-IA_MODELO = "gemini-3.6-flash"      # confira os nomes atuais no link acima
-IA_MAX_TOKENS = 1000                # inclui os tokens gastos "pensando"
-IA_RACIOCINIO = "low"               # "minimal", "low", "medium" ou "high" (None para desligar)
-# Se der erro de "thinking" com algum modelo, coloque IA_RACIOCINIO = None
+# IA de resposta (qualquer API compatível com OpenAI). Padrão: Groq, que tem plano gratuito.
+# Chave em https://console.groq.com/keys, guardada na variável de ambiente GROQ_API_KEY.
+# Para trocar: OpenAI -> "https://api.openai.com/v1" | Ollama local -> "http://localhost:11434/v1"
+IA_BASE_URL = "https://api.groq.com/openai/v1"
+IA_MODELO = "openai/gpt-oss-120b"   # confira os nomes atuais no painel do provedor
+IA_CHAVE_ENV = "GROQ_API_KEY"
+IA_MAX_TOKENS = 1000                # modelos de raciocínio gastam tokens "pensando"
+IA_RACIOCINIO = "low"               # "low", "medium" ou "high" (None para desligar)
 
-client = genai.Client(
-    api_key=os.environ.get(GEMINI_CHAVE_ENV, "sem-chave"),
-    http_options=types.HttpOptions(timeout=20000),  # 20 s: se passar disso, mostra o erro em vez de travar
+client = OpenAI(
+    base_url=IA_BASE_URL,
+    api_key=os.environ.get(IA_CHAVE_ENV, "sem-chave"),
+    timeout=15,
+    max_retries=1,
 )
 
 
@@ -140,27 +135,56 @@ def mostrar_na_tela(tela, texto):
         print(f"ERRO NA TELA: {erro}")
 
 
-def escolher_microfone():
-    """Lista os microfones e deixa o usuário escolher um."""
-    dispositivos = sd.query_devices()
-    entradas = [i for i, d in enumerate(dispositivos) if d["max_input_channels"] > 0]
+def escolher_dispositivo(tipo):
+    """Lista os dispositivos de áudio e deixa o usuário escolher um.
 
-    print("=== MICROFONES DISPONÍVEIS ===")
-    for n, i in enumerate(entradas):
+    tipo: "entrada" (microfone) ou "saida" (alto-falante).
+    Devolve o índice do dispositivo, ou None para usar o padrão do sistema (só na saída).
+    """
+    campo = "max_input_channels" if tipo == "entrada" else "max_output_channels"
+    titulo = "MICROFONES" if tipo == "entrada" else "ALTO-FALANTES"
+    dispositivos = sd.query_devices()
+    lista = [i for i, d in enumerate(dispositivos) if d[campo] > 0]
+
+    if not lista:
+        print(f"Nenhum dispositivo de {tipo} encontrado.\n")
+        return None
+
+    print(f"=== {titulo} DISPONÍVEIS ===")
+    for n, i in enumerate(lista):
         print(f"[{n}] {dispositivos[i]['name']}")
 
+    pode_padrao = tipo == "saida"
+    dica = " (Enter = padrão do sistema)" if pode_padrao else ""
+
     while True:
+        resposta = input(f"\nEscolha o número{dica}: ").strip()
+        if resposta == "" and pode_padrao:
+            print("Alto-falante escolhido: padrão do sistema\n")
+            return None
         try:
-            escolha = int(input("\nEscolha o número do microfone: "))
-            if 0 <= escolha < len(entradas):
+            escolha = int(resposta)
+            if 0 <= escolha < len(lista):
                 break
             print("Número inválido.")
         except ValueError:
             print("Digite apenas um número.")
 
-    microfone = entradas[escolha]
-    print(f"Microfone escolhido: {dispositivos[microfone]['name']}\n")
-    return microfone
+    indice = lista[escolha]
+    print(f"Dispositivo escolhido: {dispositivos[indice]['name']}\n")
+    return indice
+
+
+def taxa_de_saida(dispositivo):
+    """Devolve uma taxa de amostragem que o alto-falante aceita (tenta SAIDA_SAMPLE_RATE primeiro)."""
+    try:
+        sd.check_output_settings(device=dispositivo, samplerate=SAIDA_SAMPLE_RATE, channels=1)
+        return SAIDA_SAMPLE_RATE
+    except Exception:
+        info = sd.query_devices(dispositivo, "output")
+        taxa = int(info["default_samplerate"])
+        print(f"O alto-falante não aceita {SAIDA_SAMPLE_RATE} Hz. Usando {taxa} Hz.\n")
+        return taxa
 
 
 def carregar_vad():
@@ -173,7 +197,7 @@ def carregar_vad():
 
 
 def carregar_whisper():
-    """Carrega o Whisper local (usado só se STT_MODO = "local")."""
+    """Carrega o Whisper (transforma áudio em texto)."""
     print("Carregando Whisper Base INT8...")
     inicio = time.perf_counter()
 
@@ -191,45 +215,33 @@ def carregar_whisper():
     return recognizer
 
 
-def config_gemini(**extra):
-    """Monta a configuração das chamadas ao Gemini (com o nível de raciocínio, se ligado)."""
-    if IA_RACIOCINIO:
-        extra["thinking_config"] = types.ThinkingConfig(thinking_level=IA_RACIOCINIO)
-    return types.GenerateContentConfig(**extra)
-
-
 def transcrever_audio(recognizer, audio):
     """Recebe o áudio (numpy float32, 16 kHz) e devolve o texto falado."""
-    if STT_MODO == "gemini":
+    if STT_MODO == "groq":
         try:
-            return transcrever_gemini(audio)
+            return transcrever_groq(audio)
         except Exception as erro:
-            print(f"ERRO NO STT (Gemini): {type(erro).__name__}: {erro}")
+            print(f"ERRO NO STT (Groq): {type(erro).__name__}: {erro}")
             if recognizer is None:
                 return ""
     return transcrever_local(recognizer, audio)
 
 
-def transcrever_gemini(audio):
-    """Manda o áudio para o Gemini e recebe a transcrição."""
+def transcrever_groq(audio):
+    """Manda o áudio para o Whisper large-v3-turbo da Groq."""
     audio = audio[: DURACAO_MAXIMA_AUDIO * VAD_SAMPLE_RATE]
 
     buffer = io.BytesIO()
     sf.write(buffer, audio, VAD_SAMPLE_RATE, format="WAV", subtype="PCM_16")
 
-    resposta = client.models.generate_content(
-        model=STT_MODELO_GEMINI,
-        contents=[
-            STT_PROMPT,
-            types.Part.from_bytes(data=buffer.getvalue(), mime_type="audio/wav"),
-        ],
-        config=config_gemini(temperature=0, max_output_tokens=800),
+    resposta = client.audio.transcriptions.create(
+        model=STT_MODELO_GROQ,
+        file=("fala.wav", buffer.getvalue(), "audio/wav"),
+        language="pt",
+        prompt=STT_DICA,
+        temperature=0,
     )
-
-    texto = (resposta.text or "").strip().strip('"').strip()
-    if "[SEM FALA]" in texto.upper():
-        return ""
-    return texto
+    return resposta.text.strip()
 
 
 def transcrever_local(recognizer, audio):
@@ -244,19 +256,24 @@ def transcrever_local(recognizer, audio):
 
 
 def perguntar_ia(texto):
-    """Envia o texto ao Gemini e devolve (resposta, tempo gasto)."""
+    """Envia o texto à IA e devolve (resposta, tempo gasto)."""
     inicio = time.perf_counter()
 
-    resposta = client.models.generate_content(
+    parametros = {}
+    if IA_RACIOCINIO:
+        parametros["extra_body"] = {"reasoning_effort": IA_RACIOCINIO}
+
+    resposta = client.chat.completions.create(
         model=IA_MODELO,
-        contents=texto,
-        config=config_gemini(
-            system_instruction=PRE_PROMPT,
-            max_output_tokens=IA_MAX_TOKENS,
-        ),
+        messages=[
+            {"role": "system", "content": PRE_PROMPT},
+            {"role": "user", "content": texto},
+        ],
+        max_tokens=IA_MAX_TOKENS,
+        **parametros,
     )
 
-    conteudo = (resposta.text or "").strip()
+    conteudo = (resposta.choices[0].message.content or "").strip()
     if not conteudo:
         raise RuntimeError("A IA devolveu uma resposta vazia (tente aumentar IA_MAX_TOKENS).")
 
@@ -271,13 +288,13 @@ def limpar_para_voz(texto):
 
 
 def iniciar_piper():
-    """Prepara a pasta dos áudios temporários do Piper."""
+    """Abre o Piper UMA vez (o modelo carrega só agora, não a cada resposta)."""
     print("Preparando Piper...")
     os.makedirs(PASTA_WAV, exist_ok=True)
-    return None  # o Piper é chamado uma vez por frase, em gerar_audio
+    return None  # o Piper agora é chamado uma vez por frase, em gerar_audio
 
 
-def gerar_audio(piper, frase):
+def gerar_audio(piper, frase, taxa_saida):
     """Manda uma frase ao Piper e devolve o áudio já na taxa do alto-falante."""
     caminho = os.path.join(PASTA_WAV, "bemo_tmp.wav")
     if os.path.exists(caminho):
@@ -297,13 +314,13 @@ def gerar_audio(piper, frase):
     audio, sample_rate = sf.read(caminho, dtype="float32")
     os.remove(caminho)
 
-    if sample_rate != SAIDA_SAMPLE_RATE:
-        g = gcd(SAIDA_SAMPLE_RATE, sample_rate)
-        audio = signal.resample_poly(audio, SAIDA_SAMPLE_RATE // g, sample_rate // g)
+    if sample_rate != taxa_saida:
+        g = gcd(taxa_saida, sample_rate)
+        audio = signal.resample_poly(audio, taxa_saida // g, sample_rate // g)
     return audio.astype(np.float32)
 
 
-def falar(texto, piper):
+def falar(texto, piper, saida, taxa_saida):
     """Gera a voz frase por frase: toca a 1ª enquanto o Piper prepara a próxima."""
     texto = limpar_para_voz(texto)
     frases = [f for f in re.split(r"(?<=[.!?])\s+", texto) if f.strip()]
@@ -312,18 +329,18 @@ def falar(texto, piper):
 
     try:
         for frase in frases:
-            audio = gerar_audio(piper, frase)  # gera enquanto a frase anterior toca
+            audio = gerar_audio(piper, frase, taxa_saida)  # gera enquanto a frase anterior toca
             sd.wait()                          # espera a anterior terminar
             if primeira:
                 print(f"Tempo até o 1º áudio: {time.perf_counter() - inicio:.2f} segundos")
                 primeira = False
-            sd.play(audio, SAIDA_SAMPLE_RATE, device=DISPOSITIVO_SAIDA)
+            sd.play(audio, taxa_saida, device=saida)
         sd.wait()
     except Exception as erro:
         print(f"ERRO NO TTS: {type(erro).__name__}: {erro}")
 
 
-def processar_fala(recognizer, blocos, tela, piper):
+def processar_fala(recognizer, blocos, tela, piper, saida, taxa_saida):
     """Transcreve a fala gravada e mostra a resposta da IA."""
     print("Transcrevendo...")
 
@@ -338,14 +355,14 @@ def processar_fala(recognizer, blocos, tela, piper):
 
     inicio = time.perf_counter()
     texto = transcrever_audio(recognizer, audio)
-    tempo_stt = time.perf_counter() - inicio
+    tempo_whisper = time.perf_counter() - inicio
 
     print("\n==============================")
     print(f"VOCÊ DISSE: {texto}")
     print(f"Duração do áudio: {len(audio) / VAD_SAMPLE_RATE:.1f} segundos")
-    print(f"Tempo do STT: {tempo_stt:.2f} segundos")
+    print(f"Tempo do Whisper: {tempo_whisper:.2f} segundos")
 
-    # textos muito curtos geralmente são ruído
+    # textos muito curtos geralmente são ruído que o Whisper "inventou"
     if len(texto) < 2:
         print("Nenhuma fala reconhecida.")
     elif not PADRAO_ATIVACAO.search(texto):
@@ -357,7 +374,7 @@ def processar_fala(recognizer, blocos, tela, piper):
             print(f"\nBEMO: {resposta}")
             print(f"Tempo da IA: {tempo_ia:.2f} segundos")
             mostrar_na_tela(tela, resposta)  # texto aparece na TFT enquanto ele fala
-            falar(resposta, piper)
+            falar(resposta, piper, saida, taxa_saida)
         except Exception as erro:
             print(f"\nERRO AO CONSULTAR A IA: {type(erro).__name__}: {erro}")
 
@@ -369,11 +386,13 @@ def processar_fala(recognizer, blocos, tela, piper):
 # ============================================================
 
 def main():
-    if GEMINI_CHAVE_ENV not in os.environ:
-        print(f"AVISO: a variável de ambiente {GEMINI_CHAVE_ENV} não está definida. "
-              "O STT e as respostas da IA vão falhar.\n")
+    if IA_CHAVE_ENV not in os.environ:
+        print(f"AVISO: a variável de ambiente {IA_CHAVE_ENV} não está definida. "
+              "As respostas da IA vão falhar.\n")
 
-    microfone = escolher_microfone()
+    microfone = escolher_dispositivo("entrada")
+    saida = escolher_dispositivo("saida") if ESCOLHER_SAIDA else None
+    taxa_saida = taxa_de_saida(saida)
     tela = abrir_tela()
     piper = iniciar_piper()
     vad = carregar_vad()
@@ -403,7 +422,7 @@ def main():
                 samples, _ = stream.read(BLOCK_SIZE)
                 samples = samples.reshape(-1)
 
-                # converte de 48 kHz para 16 kHz (taxa do VAD e do STT)
+                # converte de 48 kHz para 16 kHz (taxa do VAD e do Whisper)
                 samples_16k = signal.resample_poly(
                     samples,
                     VAD_SAMPLE_RATE,
@@ -449,7 +468,7 @@ def main():
                         if duracao_fala < DURACAO_MINIMA_FALA:
                             print(">>> Fala muito curta. Ignorando.")
                         else:
-                            processar_fala(recognizer, blocos_fala, tela, piper)
+                            processar_fala(recognizer, blocos_fala, tela, piper, saida, taxa_saida)
 
                         # reseta tudo para ouvir a próxima fala
                         blocos_fala = []
